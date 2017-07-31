@@ -1,6 +1,7 @@
 package maxconnections
 
 import (
+	"context"
 	"net/http"
 	"time"
 )
@@ -12,20 +13,17 @@ func defaultOverloadHandler(w http.ResponseWriter, r *http.Request) {
 // OverloadHandler is a default OverloadHandler for Middleware.
 var OverloadHandler http.Handler = http.HandlerFunc(defaultOverloadHandler)
 
-// openTimeChannel is a channel receiving from which blocks forever.
-var openTimeChannel <-chan time.Time = make(chan time.Time)
-
 // Middleware implements the http.Handler interface.
 type Middleware struct {
-	// running is a buffered channel. Before running a handler, an empty struct
-	// is sent to the channel. When the handler is finished, one element is
-	// received back from the channel. If the channel's buffer is full, the
+	// running is a buffered channel. Before invoking the handler, an empty
+	// struct is sent to the channel. When the handler is finished, one element
+	// is received back from the channel. If the channel's buffer is full, the
 	// request is enqueued.
 	running chan struct{}
 
 	// queue is a buffered channel. An empty struct is placed into the channel
-	// while the request is waiting for a spot in the buffer of the channel
-	// running. If queue's buffer is full, the request is proccess by
+	// while a request is waiting for a spot in the running channel's buffer.
+	// If the queue channel's buffer is full, the request is proccess by
 	// OverloadHandler.
 	queue chan struct{}
 
@@ -51,65 +49,54 @@ func New(maxRunning, maxInQueue int, h http.Handler) *Middleware {
 		running: make(chan struct{}, maxRunning),
 		queue:   make(chan struct{}, maxInQueue),
 		handler: h,
+
+		OverloadHandler: OverloadHandler,
+		newTimer:        time.NewTimer,
 	}
 }
 
-func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (m *Middleware) enqueueRunning(ctx context.Context) bool {
 	select {
 	case m.running <- struct{}{}:
-		defer func() {
-			<-m.running
-		}()
-		m.handler.ServeHTTP(w, r)
-		return
+		return true
 	default:
 	}
 
 	// Slow-path.
-	overloadHandler := m.OverloadHandler
-	if overloadHandler == nil {
-		overloadHandler = OverloadHandler
-	}
-
 	select {
 	case m.queue <- struct{}{}:
+		defer func() {
+			<-m.queue
+		}()
 	default:
-		overloadHandler.ServeHTTP(w, r)
-		return
+		return false
 	}
 
-	timeout := openTimeChannel
 	var timer *time.Timer
+	var timeout <-chan time.Time
 	if m.MaxWaitInQueue > 0 {
-		newTimer := m.newTimer
-		if newTimer == nil {
-			newTimer = time.NewTimer
-		}
-		timer = newTimer(m.MaxWaitInQueue)
+		timer = m.newTimer(m.MaxWaitInQueue)
+		defer timer.Stop()
 		timeout = timer.C
 	}
 
 	select {
 	case m.running <- struct{}{}:
-		<-m.queue
-		if timer != nil {
-			timer.Stop()
-		}
+		return true
+	case <-timeout:
+	case <-ctx.Done():
+	}
+	return false
+}
 
+func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if m.enqueueRunning(r.Context()) {
 		defer func() {
 			<-m.running
 		}()
 		m.handler.ServeHTTP(w, r)
 		return
-	case <-timeout:
-		<-m.queue
-		overloadHandler.ServeHTTP(w, r)
-		return
-	case <-r.Context().Done():
-		<-m.queue
-		if timer != nil {
-			timer.Stop()
-		}
-		// Did the client go away? Do we need to send a response?
 	}
+
+	m.OverloadHandler.ServeHTTP(w, r)
 }
